@@ -1,3 +1,63 @@
+import openmeteo_requests
+import pandas as pd
+import requests_cache
+from retry_requests import retry
+
+# Setup the Open-Meteo API client with cache and retry on error
+cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
+retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+openmeteo = openmeteo_requests.Client(session=retry_session)
+
+# Request parameters
+url = "https://api.open-meteo.com/v1/forecast"
+params = {
+    "latitude": -6.37,
+    "longitude": 106.83,
+    "hourly": ["temperature_2m", "shortwave_radiation", "rain", "cloud_cover"],
+    "timezone": "auto",
+    "forecast_days": 1
+}
+responses = openmeteo.weather_api(url, params=params)
+
+# Process first location
+response = responses[0]
+print(f"Coordinates {response.Latitude()}°N {response.Longitude()}°E")
+print(f"Elevation {response.Elevation()} m asl")
+print(f"Timezone {response.Timezone()}{response.TimezoneAbbreviation()}")
+print(f"Timezone difference to GMT+0 {response.UtcOffsetSeconds()} s")
+
+# Hourly variables
+hourly = response.Hourly()
+hourly_temperature_2m = hourly.Variables(0).ValuesAsNumpy()
+hourly_shortwave_radiation = hourly.Variables(1).ValuesAsNumpy()
+hourly_rain = hourly.Variables(2).ValuesAsNumpy()
+hourly_cloud_cover = hourly.Variables(3).ValuesAsNumpy()
+
+# Create datetime index in UTC
+date_range = pd.date_range(
+    start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
+    end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
+    freq=pd.Timedelta(seconds=hourly.Interval()),
+    inclusive="left"
+)
+
+# Create dataframe
+hourly_data = {
+    "date": date_range,
+    "temperature_2m": hourly_temperature_2m,
+    "shortwave_radiation": hourly_shortwave_radiation,
+    "rain": hourly_rain,
+    "cloud_cover": hourly_cloud_cover
+}
+hourly_dataframe = pd.DataFrame(data=hourly_data)
+
+# Convert timezone to local (e.g. Jakarta)
+hourly_dataframe["date"] = hourly_dataframe["date"].dt.tz_convert("Asia/Jakarta")
+
+####################
+# SCHEDULER
+####################
+
 import pandas as pd
 import gspread
 import os
@@ -173,7 +233,7 @@ model.exclusive_actions = Constraint(model.slots, model.times, rule= exclusive_a
 # 2. SOC = soc of previous time + charging power * charge condition - discharging power * discharge condition - battery max capacity *  model swap in a given slot and times
 M_BIG_SOC_DYN = BATTERY_KWH + P_CHARGE_MAX + P_DISCHARGE_MAX # Maximum possible value of RHS or difference
 
-# Constraint 1a: Enforce dynamic update if no swap (model.swap == 0)
+# Constraint 2.1.: Enforce dynamic update if no swap (model.swap == 0)
 # This constraint ensures: model.soc[s,t] >= (dynamic_RHS) when swap=0
 def soc_dyn_if_no_swap_lower_rule(model, slots, times):
     if times == model.times.first():
@@ -195,7 +255,7 @@ def soc_dyn_if_no_swap_lower_rule(model, slots, times):
 model.soc_dyn_if_no_swap_lower = Constraint(model.slots, model.times, rule=soc_dyn_if_no_swap_lower_rule)
 
 
-# Constraint 1b: Enforce dynamic update if no swap (model.swap == 0)
+# Constraint 2.2.: Enforce dynamic update if no swap (model.swap == 0)
 # This constraint ensures: model.soc[s,t] <= (dynamic_RHS) when swap=0
 def soc_dyn_if_no_swap_upper_rule(model, slots, times):
     if times == model.times.first():
@@ -216,7 +276,7 @@ def soc_dyn_if_no_swap_upper_rule(model, slots, times):
     return model.soc[slots, times] <= dynamic_RHS + M_BIG_SOC_DYN * model.swap[slots, times]
 model.soc_dyn_if_no_swap_upper = Constraint(model.slots, model.times, rule=soc_dyn_if_no_swap_upper_rule)
 
-# Constraint 2a: Enforce SoC reset if swap occurs (model.swap == 1)
+# Constraint 2.3.: Enforce SoC reset if swap occurs (model.swap == 1)
 # This constraint ensures: model.soc[s,t] >= BATTERY_CONDITION_STATE when swap=1
 def soc_reset_if_swap_lower_rule(model, slots, times):
     if times == model.times.first():
@@ -227,7 +287,7 @@ def soc_reset_if_swap_lower_rule(model, slots, times):
 model.soc_reset_if_swap_lower = Constraint(model.slots, model.times, rule=soc_reset_if_swap_lower_rule)
 
 
-# Constraint 2b: Enforce SoC reset if swap occurs (model.swap == 1)
+# Constraint 2.4.: Enforce SoC reset if swap occurs (model.swap == 1)
 # This constraint ensures: model.soc[s,t] <= BATTERY_CONDITION_STATE when swap=1
 def soc_reset_if_swap_upper_rule(model, slots, times):
     if times == model.times.first():
@@ -259,6 +319,11 @@ def need_charge_soc_rule(model, slots, times):
 
     return model.soc[slots, times] <= BATTERY_KWH - epsilon + M * (1 - model.needs_charge[slots, times])
 model.needs_charge_from_soc = Constraint(model.slots, model.times, rule=need_charge_soc_rule)
+
+# 3.1. Force model.charge = 1 if model.needs_charge_from_soc = 1
+def charge_activation_rule(model, slots, times):
+    return model.charge[slots, times] >= model.needs_charge[slots, times]
+model.charge_activation = Constraint(model.slots, model.times, rule=charge_activation_rule)
 
 # 4. Atleast 1 slots emtpy for swapping
 model.is_full = Var(model.slots, model.times, domain=Binary)
@@ -419,7 +484,7 @@ for t in HOURS:
     rows.append(row)
 
 df=pd.DataFrame(rows)
-df.to_csv("/content/drive/My Drive/RekkaTek/360e/BSS/hourly_dispatch_new1.csv",index=False)
+df.to_csv("./hourly_dispatch_latest.csv",index=False)
 
 profit=value(model.maximize_profit)
 total_unserved=sum(int(value(model.unserved_swap[t])) for t in HOURS)
@@ -436,3 +501,5 @@ for t in range(24):
     for s in model.slots:
         print(f"Slot {s}: soc={value(model.soc[s,t]):.3f}, is_full={value(model.is_full[s,t])}, swap={value(model.swap[s,t])}")
     print(f"Swaphit = {value(model.swaphit[t])}, Unserved = {value(model.unserved_swap[t])}, Demand = {swap_hour.get(t,0)}")
+
+
