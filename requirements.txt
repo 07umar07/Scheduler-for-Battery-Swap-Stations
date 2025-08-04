@@ -1,0 +1,9 @@
+pandas
+gspread
+gspread-dataframe
+google-auth-oauthlib
+Pyomo
+openmeteo-requests
+requests-cache
+retry-requests
+highspy
