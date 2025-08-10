@@ -73,21 +73,6 @@ from pyomo.environ import (
 )
 from pyomo.util.infeasible import log_infeasible_constraints
 
-import pandas as pd
-import gspread
-import os
-from google.colab import drive
-drive.mount('/content/drive')
-# from dotenv import load_dotenv
-from gspread_dataframe import set_with_dataframe
-from google.oauth2.service_account import Credentials
-from collections import defaultdict
-from pyomo.environ import (
-    ConcreteModel, Set, Var, Binary, NonNegativeReals, Param,
-    Constraint, Objective, maximize, SolverFactory, value, NonNegativeIntegers
-)
-from pyomo.util.infeasible import log_infeasible_constraints
-
 # ---------------
 # Parameters
 # ---------------
@@ -109,9 +94,6 @@ PLN_PRICE = 1035
 
 # Revenue per battery swap (IDR)
 SWAP_PRICE = 50000
-
-# Revenue for solar surplus sold (multiplied by PLN_PRICE)
-SOLAR_SELL = 1.2 * PLN_PRICE
 
 # Degradation cost per kWh throughput (IDR)
 DEGR_COST = 150
@@ -219,14 +201,29 @@ model.battery_ready = Var(model.slots, model.times, within=Binary)
 # Objective
 # ---------------
 
+# Revenue for solar surplus sold (multiplied by PLN_PRICE)
+SOLAR_SELL = 1.2 * PLN_PRICE
+
+# Revenue per battery swap (IDR)
+SWAP_PRICE = 50000
+
+# Grid electricity purchase price (IDR per kWh)
+PLN_PRICE = 1035
+
+# Insentive for every kWh stored in the battery each hour
+SOC_INCENTIVE = 2000 # Mulai dengan nilai kecil
+
 # Revenue for all swaps that happened
-revenue_swap = 50000 * sum(model.swaphit[t] for t in HOURS)
+revenue_swap = SWAP_PRICE * sum(model.swaphit[t] for t in HOURS)
 
 # Revenue from Excessed Solar
-revenue_solar = SOLAR_SELL * sum(max(0, pv_kw[t] - store_kW[t]) for t in HOURS)
+# revenue_solar = SOLAR_SELL * sum(max(0, pv_kw[t] - store_kW[t]) for t in HOURS)
 
 # Cost to buy electricity from grid to discharged to store
 cost_grid = PLN_PRICE * sum(model.grid_kWh[t] for t in HOURS)
+
+# KOMPONEN BARU: Hadiah untuk menjaga SoC tetap tinggi
+soc_reward = SOC_INCENTIVE * sum(model.soc[s, t] for s in model.slots for t in model.times)
 
 # Cost from battery degradation due to full swaps and discharges
 # cost_degr = DEGR_COST * (
@@ -238,13 +235,15 @@ cost_grid = PLN_PRICE * sum(model.grid_kWh[t] for t in HOURS)
 penalty_unserved = 100000 * sum(model.unserved_swap[t] for t in HOURS)
 
 # Model Objective
-model.maximize_profit = Objective (expr = revenue_swap + revenue_solar - cost_grid - penalty_unserved,
+model.maximize_profit = Objective (expr = revenue_swap - cost_grid - penalty_unserved + soc_reward,
 sense = maximize
 )
 
 # --------------------------
 # Constraint
 # --------------------------
+
+epsilon = 1e-2
 
 # Initial Simulation (Akan dihapus saat real world scenario sudah berjalan)
 def initial_soc_fix_rule(model, s):
@@ -256,7 +255,7 @@ model.initial_soc_constraint = Constraint(model.slots, rule=initial_soc_fix_rule
 
 # 1. Exclusivity, where only one of charge/discharge/swap could happen at the time (charge + discharge + swap <= 1)
 def exclusive_actions_rule(model, slots, times):
-    return model.charge[slots, times] + model.discharge[slots, times] + model.idle[slots, times] <= 1
+    return model.charge[slots, times] + model.discharge[slots, times] + model.swap[slots, times] <= 1
 model.exclusive_actions = Constraint(model.slots, model.times, rule= exclusive_actions_rule)
 
 # 2. SOC = soc of previous time + charging power * charge condition - discharging power * discharge condition - battery max capacity *  model swap in a given slot and times
@@ -326,9 +325,10 @@ model.needs_charge_from_swap = Constraint(model.slots, model.times, rule=need_ch
 def need_charge_soc_rule(model, slots, times):
     if times == model.times.first():
         return Constraint.Skip
-
-    epsilon = 0.01
-    return model.soc[slots, times] <= BATTERY_KWH - epsilon + M * (1 - model.needs_charge[slots, times])
+    
+    # Mendorong needs_charge menjadi 1 jika soc di bawah threshold
+    # Contoh: jika soc = 0, maka needs_charge >= (BATTERY_KWH - 0) / M. Jika M = BATTERY_KWH, maka needs_charge >= 1.
+    return M * model.needs_charge[slots, times] >= (BATTERY_KWH - model.soc[slots, times])
 model.needs_charge_from_soc = Constraint(model.slots, model.times, rule=need_charge_soc_rule)
 
 # def need_charge_soc_rule(model, slots, times):
@@ -342,15 +342,14 @@ model.needs_charge_from_soc = Constraint(model.slots, model.times, rule=need_cha
 # model.needs_charge_from_soc = Constraint(model.slots, model.times, rule=need_charge_soc_rule)
 
 # 3.1. Force model.charge = 1 if model.needs_charge_from_soc = 1
-def charge_activation_rule(model, slots, times):
-    return model.charge[slots, times] >= model.needs_charge[slots, times]
-model.charge_activation = Constraint(model.slots, model.times, rule=charge_activation_rule)
+# def charge_activation_rule(model, slots, times):
+#     return model.charge[slots, times] >= model.needs_charge[slots, times]
+# model.charge_activation = Constraint(model.slots, model.times, rule=charge_activation_rule)
 
 # 4. Atleast 1 slots emtpy for swapping
 model.is_full = Var(model.slots, model.times, domain=Binary)
 
 def is_full_logic_rule(model, slots, times):
-    epsilon = 0.01  # margin under full capacity
     return model.soc[slots, times] >= BATTERY_KWH - epsilon - M * (1 - model.is_full[slots, times])
 model.full_logic = Constraint(model.slots, model.times, rule=is_full_logic_rule) # This forces model.is_full[i, t] = 1 only when soc[i, t] ≥ BATTERY_KWH - epsilon
 
@@ -422,38 +421,38 @@ def no_discharge_when_open_rule(model, s, t):
 
 model.no_discharge_when_open = Constraint(model.slots, model.times, rule=no_discharge_when_open_rule)
 
-#11. Idle Discharged Constraint
-def idle_upper_charge_rule(m, s, t):
-    # if (s, t) not in m.idle:
-    #     return Constraint.Skip
-    return m.idle[s, t] <= 1 - m.charge[s, t]
-model.idle_up_charge = Constraint(model.slots, model.times, rule=idle_upper_charge_rule)
+# #11. Idle Discharged Constraint
+# def idle_upper_charge_rule(m, s, t):
+#     # if (s, t) not in m.idle:
+#     #     return Constraint.Skip
+#     return m.idle[s, t] <= 1 - m.charge[s, t]
+# model.idle_up_charge = Constraint(model.slots, model.times, rule=idle_upper_charge_rule)
 
-def idle_upper_discharge_rule(m, s, t):
-    # if (s, t) not in m.idle:
-    #     return Constraint.Skip
-    return m.idle[s, t] <= 1 - m.discharge[s, t]
-model.idle_up_discharge = Constraint(model.slots, model.times, rule=idle_upper_discharge_rule)
+# def idle_upper_discharge_rule(m, s, t):
+#     # if (s, t) not in m.idle:
+#     #     return Constraint.Skip
+#     return m.idle[s, t] <= 1 - m.discharge[s, t]
+# model.idle_up_discharge = Constraint(model.slots, model.times, rule=idle_upper_discharge_rule)
 
-def idle_upper_swap_rule(m, s, t):
-    # if (s, t) not in m.idle:
-    #     return Constraint.Skip
-    return m.idle[s, t] <= 1 - m.swap[s, t]
-model.idle_up_swap = Constraint(model.slots, model.times, rule=idle_upper_swap_rule)
+# def idle_upper_swap_rule(m, s, t):
+#     # if (s, t) not in m.idle:
+#     #     return Constraint.Skip
+#     return m.idle[s, t] <= 1 - m.swap[s, t]
+# model.idle_up_swap = Constraint(model.slots, model.times, rule=idle_upper_swap_rule)
 
-def idle_lower_rule(m, s, t):
-    # if (s, t) not in m.idle:
-    #     return Constraint.Skip
-    # if all actions are zero -> idle must be 1
-    return m.idle[s, t] >= 1 - (m.charge[s, t] + m.discharge[s, t] + m.swap[s, t])
-model.idle_low = Constraint(model.slots, model.times, rule=idle_lower_rule)
+# def idle_lower_rule(m, s, t):
+#     # if (s, t) not in m.idle:
+#     #     return Constraint.Skip
+#     # if all actions are zero -> idle must be 1
+#     return m.idle[s, t] >= 1 - (m.charge[s, t] + m.discharge[s, t] + m.swap[s, t])
+# model.idle_low = Constraint(model.slots, model.times, rule=idle_lower_rule)
 
-# 12. Idle Discharged and Below Battery KWH should be Charging
-def idle_and_notfull_force_charge_rule(m, s, t):
-    # if (s, t) not in m.idle:
-    #     return Constraint.Skip
-    return m.charge[s, t] >= m.idle[s, t] + m.is_not_full[s, t] - 1
-model.idle_and_notfull_force_charge = Constraint(model.slots, model.times, rule=idle_and_notfull_force_charge_rule)
+# # 12. Idle Discharged and Below Battery KWH should be Charging
+# def idle_and_notfull_force_charge_rule(m, s, t):
+#     # if (s, t) not in m.idle:
+#     #     return Constraint.Skip
+#     return m.charge[s, t] >= m.idle[s, t] + m.is_not_full[s, t] - 1
+# model.idle_and_notfull_force_charge = Constraint(model.slots, model.times, rule=idle_and_notfull_force_charge_rule)
 
 # 13. If model.soc >= BATTERY_KWH/2 (threshold) and there is swap demand, force swap
 # Battery ready jika SOC >= threshold
@@ -478,6 +477,17 @@ def force_swap_if_ready_and_demand_rule(m, s, t):
     # m.swap adalah biner, jadi swap = 1
     return m.swap[s, t] >= m.battery_ready[s, t] + m.has_demand[t] - 1
 model.force_swap_if_ready_and_demand = Constraint(model.slots, model.times, rule=force_swap_if_ready_and_demand_rule)
+
+# Di bagian Constraint, tambahkan aturan baru ini
+
+# def swap_only_if_ready_rule(m, s, t):
+#     """
+#     Melarang swap terjadi jika baterai belum siap.
+#     Ini memastikan bahwa swap hanya bisa terjadi jika battery_ready = 1.
+#     """
+#     return m.swap[s, t] <= m.battery_ready[s, t] 
+
+# model.swap_only_if_ready = Constraint(model.slots, model.times, rule=swap_only_if_ready_rule)
 
 # # 13. Battery Readiness Constraints
 # # 1) Kalau battery_ready = 1 maka SOC >= threshold
@@ -512,9 +522,6 @@ result = solver.solve(model, tee=True)
 # ------------------------------------
 # Post-solve per-slot reconstruction and cashflows
 # ------------------------------------
-# --------------------------
-# Post-solve per-slot reporting
-# --------------------------
 
 # Berarti klarifikasi simbol:
 # ID = Idle Discharged
@@ -538,37 +545,71 @@ for t in HOURS:
 
     # Assign slot states
     for i in range(N_SLOTS):
-        soc_start[i]=round(value(model.soc[i,t-1]) if t>0 else BATTERY_KWH,2) # Sebagai simulasi, anggap soc awal full semua
+        soc_start[i] = BATTERY_KWH if t == 0 else round(value(model.soc[i,t-1]),2) # Sebagai simulasi, anggap soc awal full semua
         soc_now=round(value(model.soc[i,t]),2)
         code = "IF"
 
         is_swap = value(model.swap[i, t]) >= 0.5
         is_charge = value(model.charge[i, t]) > 0.5
         is_discharge = value(model.discharge[i, t]) > 0.5
-        is_full_val = value(model.is_full[i, t]) >= 0.5 
+        # is_idle = value(model.idle[i, t]) >= 0.5
+        is_full_val = value(model.is_full[i, t]) >= 0.5
+        is_not_full_val = value(model.is_not_full[i, t]) >= 0.5
+        is_battery_ready = value(model.battery_ready[i, t]) >= 0.5
+        is_demand = value(model.has_demand[t]) >= 0.5
+        P_CHARGE_NOW = P_CHARGE_MAX
 
         print(f"Hour: {t}, Slot: {i}, model.swap value: {value(model.swap[i,t])}, is_swap flag: {is_swap}")
-        
+
         if is_discharge:
-            code = "D"
+            # print(f"Is Idle: {is_idle}")
+            print(f"Is Charge: {is_charge}")
+            print(f"Is Not Full: {is_not_full_val}")
+            print(f"Is Battery Ready: {is_battery_ready}")
+            print(f"Is Discharge: {is_discharge}")
+            print(f"Have demands: {is_demand}")
+            code = "D" # Discharging
         elif is_swap:
+            # print(f"Is Idle: {is_idle}")
+            print(f"Is Charge: {is_charge}")
+            print(f"Is Not Full: {is_not_full_val}")
+            print(f"Is Battery Ready: {is_battery_ready}")
+            print(f"Is Discharge: {is_discharge}")
+            print(f"Have demands: {is_demand}")
             if soc_now >= BATTERY_KWH - 0.01:
-                code = "SIF" # Swap then idle full
+                code = "SIF" # Swap then Idle Full
             else:
-                code = "SID" # Swap then idle
+                code = "SID" # Swap then Idle Discharged
         elif is_charge:
-            if available_pv[t] > P_CHARGE_MAX: #Seharusnya P Charge Max per slot ya
-               code = "CS" # 
-               available_pv[t] -= P_CHARGE_MAX
-               solar_used += available_pv[t] - P_CHARGE_MAX
+            # print(f"Is Idle: {is_idle}")
+            print(f"Is Charge: {is_charge}")
+            print(f"Is Not Full: {is_not_full_val}")
+            print(f"Is Battery Ready: {is_battery_ready}")
+            print(f"Is Discharge: {is_discharge}")
+            print(f"Have demands: {is_demand}")
+            if available_pv[t] > P_CHARGE_NOW: #Seharusnya P Charge Max per slot ya
+               code = "CS" # Charging Solar
+               available_pv[t] -= P_CHARGE_NOW
+               solar_used += P_CHARGE_NOW
+            elif 0 < available_pv[t] < P_CHARGE_NOW:
+               code = "CM" # Charging Mix
+               solar_used += available_pv[t]
+               grid_used += (P_CHARGE_NOW - available_pv[t])
+               available_pv[t] = 0
             else:
-                code = "CG"
-                grid_used += P_CHARGE_MAX - available_pv[t]
+                code = "CG" # Charging Grid
+                grid_used += P_CHARGE_NOW
         else:
+            # print(f"Is Idle: {is_idle}")
+            print(f"Is Charge: {is_charge}")
+            print(f"Is Not Full: {is_not_full_val}")
+            print(f"Is Battery Ready: {is_battery_ready}")
+            print(f"Is Discharge: {is_discharge}")
+            print(f"Have demands: {is_demand}")
             if soc_now >= BATTERY_KWH - 0.01:
-                code = "IF"
+                code = "IF" # Idle Full
             else:
-                code = "ID"
+                code = "ID" # Idle Discharged
 
         # === 🔍 SoC consistency sanity checks ===
         if code == "D" and soc_now > soc_start[i] + 0.01:
@@ -583,9 +624,9 @@ for t in HOURS:
     # Cashflows
     chg_kWh=P_CHARGE_MAX*sum(value(model.charge[i,t]) for i in model.slots)
     dis_kWh=P_DISCHARGE_MAX*sum(value(model.discharge[i,t]) for i in model.slots)
-    grid_bss=max(0,chg_kWh-available_pv[t])
-    pln_store_cost=PLN_PRICE*max(0,store_kW[t]-available_pv[t])
-    pln_bss_cost=PLN_PRICE*grid_bss
+    grid_bss = value(model.grid_kWh[t])
+    pln_store_cost = PLN_PRICE * max(0, store_kW[t] - available_pv[t])
+    pln_bss_cost = PLN_PRICE * grid_bss
     pln_total=pln_store_cost+pln_bss_cost
     pln_store_revenue=PLN_PRICE*min(store_kW[t],available_pv[t]+value(model.grid_kWh[t]))
     solar_revenue=SOLAR_SELL*min(store_kW[t],available_pv[t])
@@ -627,10 +668,11 @@ print(f"Total profit IDR: {profit:,.0f}")
 print(f"Unserved swaps: {int(total_unserved)}")
 print("CSV written → hourly_dispatch.csv")
 print("\n-- Swap status at t=16 --")
-for t in range(24):
-    print(f"\n--- Hour {t} ---")
-    for s in model.slots:
-        print(f"Slot {s}: soc={value(model.soc[s,t]):.3f}, is_full={value(model.is_full[s,t])}, swap={value(model.swap[s,t])}")
-    print(f"Swaphit = {value(model.swaphit[t])}, Unserved = {value(model.unserved_swap[t])}, Demand = {swap_hour.get(t,0)}")
+# for t in range(24):
+#     print(f"\n--- Hour {t} ---")
+#     for s in model.slots:
+#         print(f"Slot {s}: soc={value(model.soc[s,t]):.3f}, is_full={value(model.is_full[s,t])}, swap={value(model.swap[s,t])}")
+#     print(f"Swaphit = {value(model.swaphit[t])}, Unserved = {value(model.unserved_swap[t])}, Demand = {swap_hour.get(t,0)}")
+
 
 
