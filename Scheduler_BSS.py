@@ -127,6 +127,12 @@ SWAP_TIMES = """
 21:42:48 21:49:30 22:05:01 22:14:03
 """.split()
 
+# 07:25:32 08:33:17 09:11:08 09:11:41 09:20:38 09:23:15 09:24:15
+# 09:29:56 09:45:23 09:49:07 09:50:43 12:03:36 12:05:49 12:09:11
+# 12:29:04 12:38:35 12:44:24 15:41:29 18:04:06 18:06:30 18:10:55
+# 18:13:27 18:14:44 18:15:36 18:20:19 18:37:48 18:45:00 19:46:50
+# 21:42:48 21:49:30 22:05:01 22:14:03
+
 # Times
 HOURS = range(24)
 swap_hour = defaultdict(int)
@@ -191,7 +197,7 @@ model.excess_solar = Var(model.times, domain = NonNegativeReals)
 # Model Idle
 model.idle = Var(model.slots, model.times, domain = Binary)
 
-# Threshold parameter 
+# Threshold parameter
 model.threshold = Param(initialize=threshold)
 
 # Battery Readiness
@@ -205,13 +211,13 @@ model.battery_ready = Var(model.slots, model.times, within=Binary)
 SOLAR_SELL = 1.2 * PLN_PRICE
 
 # Revenue per battery swap (IDR)
-SWAP_PRICE = 50000
+SWAP_PRICE = 5000000
 
 # Grid electricity purchase price (IDR per kWh)
 PLN_PRICE = 1035
 
 # Insentive for every kWh stored in the battery each hour
-SOC_INCENTIVE = 2000 # Mulai dengan nilai kecil
+SOC_INCENTIVE = 5000 # Mulai dengan nilai kecil
 
 # Revenue for all swaps that happened
 revenue_swap = SWAP_PRICE * sum(model.swaphit[t] for t in HOURS)
@@ -247,8 +253,8 @@ epsilon = 1e-2
 
 # Initial Simulation (Akan dihapus saat real world scenario sudah berjalan)
 def initial_soc_fix_rule(model, s):
-    # Memaksa SoC untuk setiap slot 's' pada waktu pertama ('model.times.first()')
-    # agar sama dengan kapasitas penuh baterai (BATTERY_KWH).
+    # Force SoC for each slot 's' at the first time ('model.times.first()')
+    # to be equal with full capacity of the battery (BATTERY_KWH).
     return model.soc[s, model.times.first()] == BATTERY_KWH
 
 model.initial_soc_constraint = Constraint(model.slots, rule=initial_soc_fix_rule)
@@ -325,8 +331,8 @@ model.needs_charge_from_swap = Constraint(model.slots, model.times, rule=need_ch
 def need_charge_soc_rule(model, slots, times):
     if times == model.times.first():
         return Constraint.Skip
-    
-    # Mendorong needs_charge menjadi 1 jika soc di bawah threshold
+
+    # Makes needs_charge == 1 if SOC below threshold
     # Contoh: jika soc = 0, maka needs_charge >= (BATTERY_KWH - 0) / M. Jika M = BATTERY_KWH, maka needs_charge >= 1.
     return M * model.needs_charge[slots, times] >= (BATTERY_KWH - model.soc[slots, times])
 model.needs_charge_from_soc = Constraint(model.slots, model.times, rule=need_charge_soc_rule)
@@ -394,26 +400,20 @@ def total_swaps_hit_rule(model, times):
     return model.swaphit[times] == sum(model.swap[i, times] for i in model.slots)
 model.total_swaps_hit = Constraint(model.times, rule=total_swaps_hit_rule)
 
-# 9.
+# 9. Is Not Full Constraint
 model.is_not_full = Var(model.slots, model.times, within=Binary)
-eps = 1e-2
-    
-# Mbig dan eps sudah didefinisikan
 
-# Kendala 1: Jika is_not_full == 1, maka SOC harus kurang dari BATTERY_KWH
-# Ekspresi ini memastikan bahwa jika is_not_full = 1, maka SOC <= BATTERY_KWH - eps
+# 9.1. If is_not_full == 1, so the SOC should be less than BATTERY_KWH
 def is_not_full_up_fixed_rule(m, s, t):
     return m.soc[s, t] <= BATTERY_KWH - eps + M * (1 - m.is_not_full[s, t])
 model.is_not_full_up_fixed = Constraint(model.slots, model.times, rule=is_not_full_up_fixed_rule)
 
-# Kendala 2: Jika is_not_full == 0, maka SOC harus sama dengan BATTERY_KWH
-# Ekspresi ini memastikan bahwa jika is_not_full = 0, maka SOC >= BATTERY_KWH - eps
+# 9.2. If is_not_full == 0, the SOC should be equal to BATTERY_KWH - eps
 def is_not_full_low_fixed_rule(m, s, t):
     return m.soc[s, t] >= BATTERY_KWH - eps - M * m.is_not_full[s, t]
 model.is_not_full_low_fixed = Constraint(model.slots, model.times, rule=is_not_full_low_fixed_rule)
 
-#10.
-# Constraint: No discharge during store open hours
+#10.Constraint: No discharge during store open hours
 def no_discharge_when_open_rule(model, s, t):
     if t in OPEN_HOURS:
         return model.discharge[s, t] == 0
@@ -458,36 +458,42 @@ model.no_discharge_when_open = Constraint(model.slots, model.times, rule=no_disc
 # Battery ready jika SOC >= threshold
 model.has_demand = Param(model.times, initialize=lambda m, t: 1 if swap_hour.get(t, 0) > 0 else 0, within=Binary)
 
-# Kendala 1: Jika baterai siap (battery_ready = 1), maka SOC harus di atas ambang batas.
+# 13.1. If the battery is ready (battery_ready = 1), the SOC should be above threhsold.
 def soc_ready_if_true_rule(m, s, t):
-    return m.soc[s, t] >= threshold - M * (1 - m.battery_ready[s, t])
+    if t == m.times.first(): # <-- TAMBAHKAN BARIS INI
+        return Constraint.Skip # <-- DAN BARIS INI
+    time_previous = m.times.prev(t)
+    return m.soc[s, time_previous] >= threshold - M * (1 - m.battery_ready[s, t])
 model.soc_ready_if_true = Constraint(model.slots, model.times, rule=soc_ready_if_true_rule)
 
-# Kendala 2: Jika SOC di atas ambang batas, maka baterai harus siap (battery_ready = 1).
+# 13.2. If SOC is above threshold, the battery should be ready (battery_ready = 1).
 def ready_if_soc_is_sufficient_rule(m, s, t):
-    # Logika implikasi: (SOC > threshold) => (battery_ready == 1)
-    # Ini memastikan bahwa jika SOC tinggi, maka battery_ready akan bernilai 1.
-    return m.battery_ready[s, t] >= (m.soc[s, t] - threshold + eps) / M
+    #(SOC > threshold) => (battery_ready == 1)
+    # Make sure that if SOC is so high, the battery_ready variable should be = 1.
+    if t == m.times.first(): # <-- TAMBAHKAN BARIS INI
+        return Constraint.Skip # <-- DAN BARIS INI
+    time_previous = m.times.prev(t)
+    return m.battery_ready[s, t] >= (m.soc[s, time_previous] - threshold + eps) / M
 model.ready_if_soc_is_sufficient = Constraint(model.slots, model.times, rule=ready_if_soc_is_sufficient_rule)
 
 # Force swap jika ready + demand + tidak discharge
 
-def force_swap_if_ready_and_demand_rule(m, s, t):
-    # Jika ready & ada demand & tidak discharge → swap >= 1
-    # m.swap adalah biner, jadi swap = 1
-    return m.swap[s, t] >= m.battery_ready[s, t] + m.has_demand[t] - 1
-model.force_swap_if_ready_and_demand = Constraint(model.slots, model.times, rule=force_swap_if_ready_and_demand_rule)
+# def force_swap_if_ready_and_demand_rule(m, s, t):
+#     # Jika ready & ada demand & tidak discharge → swap >= 1
+#     # m.swap adalah biner, jadi swap = 1
+#     return m.swap[s, t] >= m.battery_ready[s, t] + m.has_demand[t] - 1
+# model.force_swap_if_ready_and_demand = Constraint(model.slots, model.times, rule=force_swap_if_ready_and_demand_rule)
 
 # Di bagian Constraint, tambahkan aturan baru ini
 
-# def swap_only_if_ready_rule(m, s, t):
-#     """
-#     Melarang swap terjadi jika baterai belum siap.
-#     Ini memastikan bahwa swap hanya bisa terjadi jika battery_ready = 1.
-#     """
-#     return m.swap[s, t] <= m.battery_ready[s, t] 
+def swap_only_if_ready_rule(m, s, t):
+    """
+    Melarang swap terjadi jika baterai belum siap.
+    Ini memastikan bahwa swap hanya bisa terjadi jika battery_ready = 1.
+    """
+    return m.swap[s, t] <= m.battery_ready[s, t]
 
-# model.swap_only_if_ready = Constraint(model.slots, model.times, rule=swap_only_if_ready_rule)
+model.swap_only_if_ready = Constraint(model.slots, model.times, rule=swap_only_if_ready_rule)
 
 # # 13. Battery Readiness Constraints
 # # 1) Kalau battery_ready = 1 maka SOC >= threshold
@@ -508,7 +514,7 @@ model.force_swap_if_ready_and_demand = Constraint(model.slots, model.times, rule
 # GIMANA KALO JIKA SEBELUMNYA CHARGING = 1, MAKA MODEL SAAT INI MEMERIKSA APAKAH SEBELUMNYA CHARGING = 1 ATAU TIDAK?
 # JIKA YA, MAKA PERIKSA APAKAH MODEL.SOC=1 ATAU TIDAK?
 # JIKA YA, PERIKSA APAKAH STATUS SAAT INI DISCHARGING ATAU IDLE?
-# JIKA IDLE, MAKA FORCE CHARGE = 1 
+# JIKA IDLE, MAKA FORCE CHARGE = 1
 
 # --------------------------
 # Solver
@@ -544,7 +550,7 @@ for t in HOURS:
     dis=0 # Discharge
 
     # Assign slot states
-    for i in range(N_SLOTS):
+     for i in range(N_SLOTS):
         soc_start[i] = BATTERY_KWH if t == 0 else round(value(model.soc[i,t-1]),2) # Sebagai simulasi, anggap soc awal full semua
         soc_now=round(value(model.soc[i,t]),2)
         code = "IF"
@@ -555,7 +561,9 @@ for t in HOURS:
         # is_idle = value(model.idle[i, t]) >= 0.5
         is_full_val = value(model.is_full[i, t]) >= 0.5
         is_not_full_val = value(model.is_not_full[i, t]) >= 0.5
-        is_battery_ready = value(model.battery_ready[i, t]) >= 0.5
+        if t != 00:
+              is_battery_ready = value(model.battery_ready[i, t]) >= 0.5
+        
         is_demand = value(model.has_demand[t]) >= 0.5
         P_CHARGE_NOW = P_CHARGE_MAX
 
@@ -565,7 +573,8 @@ for t in HOURS:
             # print(f"Is Idle: {is_idle}")
             print(f"Is Charge: {is_charge}")
             print(f"Is Not Full: {is_not_full_val}")
-            print(f"Is Battery Ready: {is_battery_ready}")
+            if t != 00:
+              print(f"Is Battery Ready: {is_battery_ready}")
             print(f"Is Discharge: {is_discharge}")
             print(f"Have demands: {is_demand}")
             code = "D" # Discharging
@@ -573,7 +582,8 @@ for t in HOURS:
             # print(f"Is Idle: {is_idle}")
             print(f"Is Charge: {is_charge}")
             print(f"Is Not Full: {is_not_full_val}")
-            print(f"Is Battery Ready: {is_battery_ready}")
+            if t != 00:
+              print(f"Is Battery Ready: {is_battery_ready}")
             print(f"Is Discharge: {is_discharge}")
             print(f"Have demands: {is_demand}")
             if soc_now >= BATTERY_KWH - 0.01:
@@ -584,7 +594,8 @@ for t in HOURS:
             # print(f"Is Idle: {is_idle}")
             print(f"Is Charge: {is_charge}")
             print(f"Is Not Full: {is_not_full_val}")
-            print(f"Is Battery Ready: {is_battery_ready}")
+            if t != 00:
+              print(f"Is Battery Ready: {is_battery_ready}")
             print(f"Is Discharge: {is_discharge}")
             print(f"Have demands: {is_demand}")
             if available_pv[t] > P_CHARGE_NOW: #Seharusnya P Charge Max per slot ya
@@ -603,7 +614,8 @@ for t in HOURS:
             # print(f"Is Idle: {is_idle}")
             print(f"Is Charge: {is_charge}")
             print(f"Is Not Full: {is_not_full_val}")
-            print(f"Is Battery Ready: {is_battery_ready}")
+            if t != 00:
+              print(f"Is Battery Ready: {is_battery_ready}")
             print(f"Is Discharge: {is_discharge}")
             print(f"Have demands: {is_demand}")
             if soc_now >= BATTERY_KWH - 0.01:
